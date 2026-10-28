@@ -23,6 +23,7 @@ Teste rápido: UFS_USAR = "SE AC". Pela linha de comando os mesmos parâmetros e
 Requer: pandas, numpy, matplotlib.
 """
 import argparse
+import hashlib
 import sys
 import urllib.request
 import zipfile
@@ -43,6 +44,8 @@ UFS_USAR = "AC AL AM AP BA CE DF ES GO MA MG MS MT PA PB PE PI PR RJ RN RO RR RS
 CAND_A, CAND_B = 13, 22
 YLIM = "40,60"                     # eixo Y em %, ou "auto"
 MOSTRAR = True                     # abre o gráfico na tela (além de salvar o PNG)
+PASSO_DERIVADA = 5                 # passo do eixo X da derivada, em % das seções (maior = tendência de longo prazo)
+DERIV_YLIM = "auto"                # eixo Y da derivada, ex.: "-1,1", ou "auto"
 # =================================================================================================
 
 if not MOSTRAR:
@@ -69,22 +72,60 @@ def achar(cols, *nomes):
     return None
 
 
+def zip_ok(arq):
+    """True se o arquivo existe e é um ZIP íntegro (download truncado não passa)."""
+    try:
+        return arq.exists() and arq.stat().st_size > 0 and zipfile.is_zipfile(arq)
+    except OSError:
+        return False
+
+
 def baixar(ano, uf, destino):
     destino.mkdir(parents=True, exist_ok=True)
     arq = destino / Path(URLS[ano].format(uf=uf)).name
-    if arq.exists() and arq.stat().st_size > 0:
+    if zip_ok(arq):
         return arq
+    if arq.exists():
+        print(f"  {arq.name} está incompleto/corrompido: baixando de novo")
+        arq.unlink()
     print(f"  baixando {arq.name} ...", flush=True)
+    tmp = arq.with_name(arq.name + ".part")
     req = urllib.request.Request(URLS[ano].format(uf=uf), headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req) as r, open(arq, "wb") as f:
+        with urllib.request.urlopen(req) as r, open(tmp, "wb") as f:
             while chunk := r.read(1 << 20):
                 f.write(chunk)
+        tmp.replace(arq)
     except Exception as e:
-        arq.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise SystemExit(f"Falha ao baixar {URLS[ano].format(uf=uf)}: {e}\n"
                          f"Baixe manualmente no Portal de Dados Abertos do TSE e coloque o ZIP em {destino}.")
+    if not zip_ok(arq):
+        arq.unlink(missing_ok=True)
+        raise SystemExit(f"{arq.name}: arquivo baixado não é um ZIP válido.")
     return arq
+
+
+def nome_cache(ano, ufs, cand_a, cand_b):
+    h = hashlib.md5(",".join(sorted(ufs)).encode()).hexdigest()[:6]
+    return f"secoes_{ano}_{cand_a}x{cand_b}_{len(ufs)}ufs_{h}.csv.gz"
+
+
+def checar_downloads(base, saida, ufs, cand_a, cand_b, refazer):
+    print("=== Checagem dos arquivos ===")
+    for ano in (2022, 2026):
+        cache = saida / nome_cache(ano, ufs, cand_a, cand_b)
+        if cache.exists() and not refazer:
+            print(f"[{ano}] cache de seções encontrado ({cache.name}): ZIPs não são necessários")
+            continue
+        ok, falta, ruim = [], [], []
+        for uf in ufs:
+            arq = base / str(ano) / Path(URLS[ano].format(uf=uf)).name
+            (ok if zip_ok(arq) else ruim if arq.exists() else falta).append(uf)
+        print(f"[{ano}] ZIPs prontos: {len(ok)}/{len(ufs)}"
+              + (f" | faltam: {' '.join(falta)}" if falta else "")
+              + (f" | incompletos/corrompidos: {' '.join(ruim)}" if ruim else ""))
+    print()
 
 
 def ler_zip(path, cand_a, cand_b):
@@ -148,7 +189,7 @@ def ler_zip(path, cand_a, cand_b):
 
 
 def carregar_ano(ano, base, ufs, cand_a, cand_b, saida, fazer_download, refazer):
-    cache = saida / f"secoes_{ano}.csv.gz"
+    cache = saida / nome_cache(ano, ufs, cand_a, cand_b)
     if cache.exists() and not refazer:
         print(f"[{ano}] usando cache {cache}")
         df = pd.read_csv(cache, parse_dates=["recebido"])
@@ -157,11 +198,11 @@ def carregar_ano(ano, base, ufs, cand_a, cand_b, saida, fazer_download, refazer)
         partes = []
         for uf in ufs:
             arq = pasta / Path(URLS[ano].format(uf=uf)).name
-            if not arq.exists():
+            if not zip_ok(arq):
                 if fazer_download:
                     arq = baixar(ano, uf, pasta)
                 else:
-                    raise SystemExit(f"Falta {arq}. Use --baixar ou coloque os ZIPs em {pasta}.")
+                    raise SystemExit(f"Falta ou está corrompido: {arq}. Use --baixar ou coloque os ZIPs em {pasta}.")
             print(f"[{ano}] lendo {uf}", flush=True)
             partes.append(ler_zip(arq, cand_a, cand_b))
         df = pd.concat([p for p in partes if len(p)], ignore_index=True)
@@ -306,6 +347,65 @@ def curva_dupla(df, pontos=4000):
     return x[idx], (ca / tot * 100)[idx], (cb / tot * 100)[idx]
 
 
+PAINEIS = [
+    (2022, "real", "2022 na ordem real (2022)"),
+    (2022, "reord", "2022 na ordem de 2026"),
+    (2026, "real", "2026 na ordem real (2026)"),
+    (2026, "reord", "2026 na ordem de 2022"),
+]
+
+
+def derivada(df, passo=0.5):
+    """1ª derivada de cada curva de % dos votos válidos em relação ao % de seções apuradas.
+
+    Unidade: pontos percentuais de voto válido por ponto percentual de seções apuradas.
+    Calculada por diferenças finitas numa grade regular de `passo` % das seções.
+    Como %A + %B = 100, a derivada de B é o espelho (sinal trocado) da de A.
+    """
+    ca, cb = df["va"].cumsum().to_numpy(float), df["vb"].cumsum().to_numpy(float)
+    n = len(df)
+    grade = np.arange(passo, 100 + 1e-9, passo)
+    idx = np.clip(np.round(grade / 100 * n).astype(int) - 1, 0, n - 1)
+    tot = np.maximum(ca[idx] + cb[idx], 1)
+    pa, pb = ca[idx] / tot * 100, cb[idx] / tot * 100
+    return grade, np.gradient(pa, grade), np.gradient(pb, grade)
+
+
+def desenhar_derivada(res, cand_a, cand_b, passo, ylim, saida):
+    dados = [derivada(res[(ano, tipo)], passo) for ano, tipo, _ in PAINEIS]
+    if ylim is None:
+        corte = max(5, 2 * passo)  # ignora o início, onde a derivada explode
+        v = np.concatenate([np.abs(np.r_[da[g >= corte], db[g >= corte]]) for g, da, db in dados])
+        lim = float(np.percentile(v, 98)) * 1.2 if v.size else 1.0
+        ylim = (-lim, lim)
+    fig, axs = plt.subplots(2, 2, figsize=(14, 9), sharex=True, sharey=True)
+    for ax, (ano, tipo, titulo), (g, da, db) in zip(axs.ravel(), PAINEIS, dados):
+        mk = "o" if passo >= 2 else None
+        ax.plot(g, da, color=COR_CAND["a"], lw=1.6, marker=mk, ms=4, label=f"Candidato {cand_a}")
+        ax.plot(g, db, color=COR_CAND["b"], lw=1.6, marker=mk, ms=4, label=f"Candidato {cand_b}")
+        ax.set_xticks(np.arange(0, 101, max(passo, 10)))
+        ax.axhline(0, color="#777", lw=0.8)
+        ax.set_ylim(*ylim)
+        ax.set_title(titulo, fontsize=12)
+        ax.legend(frameon=False, loc="upper right")
+        estilo(ax)
+    for ax in axs[1]:
+        ax.set_xlabel("% das seções apuradas")
+    for ax in axs[:, 0]:
+        ax.set_ylabel("d(% votos válidos) / d(% seções)  [p.p. por p.p.]")
+    fig.suptitle("1ª derivada das curvas de apuração (13 x 22)", fontsize=14)
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
+    fig.text(0.01, 0.005, f"Diferenças finitas a cada {passo}% das seções; eixo Y limitado a "
+             f"±{ylim[1]:.2f}, o início da apuração pode sair da escala. "
+             f"A derivada de um candidato é o espelho da do outro (%13 + %22 = 100).",
+             fontsize=9, color="#555")
+    p = saida / "apuracao_13x22_derivada.png"
+    fig.savefig(p, dpi=150)
+    if not MOSTRAR:
+        plt.close(fig)
+    return p
+
+
 def desenhar(res, cand_a, cand_b, ylim, saida):
     paineis = [
         (2022, "real", "2022 na ordem real (2022)"),
@@ -354,6 +454,8 @@ def main():
     ap.add_argument("--ufs", default=",".join(UFS_USAR.replace(",", " ").split()), help="UFs separadas por vírgula (ZZ = exterior)")
     ap.add_argument("--cand-a", type=int, default=CAND_A, help="número do candidato A")
     ap.add_argument("--cand-b", type=int, default=CAND_B, help="número do candidato B")
+    ap.add_argument("--passo-deriv", type=float, default=PASSO_DERIVADA, help="passo (em %% das seções) da derivada")
+    ap.add_argument("--deriv-ylim", default=DERIV_YLIM, help='eixo Y da derivada, ex.: "-1,1", ou "auto"')
     ap.add_argument("--ylim", default=YLIM, help='limites do eixo Y em %%, ex.: "40,60", ou "auto"')
     a, _ = ap.parse_known_args()  # ignora argumentos extras que algumas IDEs/Jupyter injetam
 
@@ -361,6 +463,7 @@ def main():
     base, saida = Path(a.dir), Path(a.saida)
     saida.mkdir(parents=True, exist_ok=True)
 
+    checar_downloads(base, saida, ufs, a.cand_a, a.cand_b, a.refazer)
     d22 = carregar_ano(2022, base, ufs, a.cand_a, a.cand_b, saida, a.baixar, a.refazer)
     d26 = carregar_ano(2026, base, ufs, a.cand_a, a.cand_b, saida, a.baixar, a.refazer)
 
@@ -411,7 +514,9 @@ def main():
 
     ylim = None if a.ylim.lower() == "auto" else tuple(float(v) for v in a.ylim.split(","))
     p1 = desenhar(res, a.cand_a, a.cand_b, ylim, saida)
-    print(f"\nGráfico: {p1}")
+    dylim = None if a.deriv_ylim.lower() == "auto" else tuple(float(v) for v in a.deriv_ylim.split(","))
+    p2 = desenhar_derivada(res, a.cand_a, a.cand_b, a.passo_deriv, dylim, saida)
+    print(f"\nGráficos: {p1}\n          {p2}")
     if MOSTRAR:
         plt.show()
 
